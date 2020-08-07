@@ -1,12 +1,10 @@
-// TODO: Disallow unused code
 // TODO: Break main.rs into modules: vec, species, board, cell
-#![allow(unused)]
 use grid::Grid;
-use std::ops::{Add, AddAssign};
 use vecmath::*;
 use std::iter::Iterator;
 use std::convert::TryInto;
 use std::mem::swap;
+use rand::random;
 
 type Vec2 = Vector2<f32>;
 type Loc2 = Vector2<isize>;
@@ -32,6 +30,14 @@ fn velocity_to_offset(vel: Vec2) -> Loc2 {
     }
 }
 
+fn cap_vec(vec: Vec2) -> Vec2 {
+    if vec2_square_len(vec) > 1.0 {
+        vec2_normalized(vec)
+    } else {
+        vec
+    }
+}
+
 fn grid_get<T>(grid: &Grid<T>, loc: Loc2) -> Option<&T>
   where T: std::clone::Clone
 {    
@@ -46,7 +52,8 @@ fn grid_get_mut<T>(grid: &mut Grid<T>, loc: Loc2) -> Option<&mut T>
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Species {
     Air,
-    Sand
+    Sand,
+    Water,
 }
 
 impl Species {
@@ -54,34 +61,32 @@ impl Species {
     /// of this species
     fn get_char(&self) -> char {
         match self {
-            Species::Air  => ' ',
-            Species::Sand => '%',
+            Species::Air   => ' ',
+            Species::Sand  => '%',
+            Species::Water => '.',
         }
     }
 
-    /// Get the offset within the subgrid,
-    /// x and y in the range of (-0.5)..(0.5)
-    ///
-    /// The result may depend on random number generation,
-    /// thus varying from call to call.
-    // TODO: Species::get_subgrid_offset: Replace with cell.motion.normalized * cell.species.get_subgrid_magnitude?
-    fn get_subgrid_offset(&self) -> Vec2 {
-        use rand::random;
+    /// The factor in which the cell.motion.normalized is applied to the subgrid position.
+    /// range: -0.5..0.5
+    fn get_subgrid_magnitude(&self) -> f32 {
         match self {
-            Species::Air  => [0.0, 0.0],
-            Species::Sand => [random::<f32>() * 0.5 - 0.25, random::<f32>() * 0.5 - 0.25],
+            Species::Air   => 0.0,
+            Species::Sand  => 0.2,
+            Species::Water => 0.4,
         }
     }
 
-    /// How liquid is this material? (rather than solid)
+    /// How solid is this material
     /// A less solid material will let other materials
-    ///     pass through and displace it more easily.
-    ///
-    /// range: 0..1
-    fn get_fluidity(&self) -> f32 {
+    ///     pass through and displace it more easily, like liquid.
+    /// (multiplied against the mass during collisions, but not friction.)
+    /// range: 0..1 ( != 0, or else NaN)
+    fn get_solidity(&self) -> f32 {
         match self {
-            Species::Air  => 0.8, // some thick air in here, eh?
-            Species::Sand => 0.2,
+            Species::Air   => 0.1,
+            Species::Sand  => 1.0,
+            Species::Water => 0.7,
         }
     }
 
@@ -91,8 +96,9 @@ impl Species {
     /// range: >0
     fn get_mass(&self) -> f32 {
         match self {
-            Species::Air  => 0.1,
-            Species::Sand => 1.0,
+            Species::Air   => 0.1,
+            Species::Sand  => 2.5,
+            Species::Water => 1.0, // 1.0g/(cm)^3
         }
     }
 
@@ -102,8 +108,9 @@ impl Species {
     fn get_gravity(&self) -> Vec2 {
         match self {
             // could give a slight weight, but don't right now
-            Species::Air  => [0.0,0.0],
-            Species::Sand => [0.0,1.9],
+            Species::Air   => [0.0,0.0],
+            Species::Sand  => [0.0,1.9],
+            Species::Water => [0.0,1.9],
         }
     }
 
@@ -111,8 +118,19 @@ impl Species {
     /// range: 0..1
     fn get_friction_coeff(&self) -> f32 {
         match self {
-            Species::Air  => 0.16,
-            Species::Sand => 0.05,
+            Species::Air   => 0.20,
+            Species::Sand  => 0.08,
+            Species::Water => 0.05,
+        }
+    }
+
+    /// How much of the energy of a collision is maintained
+    /// range: 0..1
+    fn get_elasticity(&self) -> f32 {
+        match self {
+            Species::Air   => 0.8,
+            Species::Sand  => 0.0,
+            Species::Water => 0.2,
         }
     }
 }
@@ -130,6 +148,12 @@ struct Cell {
     /// Motion is set to velocity at the start of the step, and depleted by the end of a step
     motion: Vec2,
     species: Species,
+}
+
+impl Cell {
+    fn get_subgrid_offset(&self) -> Vec2 {
+        vec2_scale(cap_vec(self.motion), self.species.get_subgrid_magnitude())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -180,9 +204,9 @@ impl Board {
         for cell in self.grid.iter_mut() {
             cell.velocity = vec2_add(cell.velocity, cell.species.get_gravity());
             //HACKHACK: Try to calm the sandstorm by slowing down the air
-            if cell.species == Species::Air {
-                cell.velocity = vec2_scale(cell.velocity, 0.3);
-            }
+            //if cell.species == Species::Air {
+            //    cell.velocity = vec2_scale(cell.velocity, 0.3);
+            //}
         }
     }
     /// Resolves velocity
@@ -192,7 +216,33 @@ impl Board {
             for x in 0..cols {
                 let loc = [x as isize, y as isize];
 
-                // 1. Calculate and apply friction
+                // 1. Calculate and apply pushing
+                let cell = grid_get(&self.grid, loc).unwrap();
+                let offset = velocity_to_offset(cell.velocity);
+                let rel_pos = [offset[0] as f32, offset[1] as f32];
+                let dest = vec2_add(loc, offset);
+                let other = grid_get(&self.grid, dest);
+
+                // The total momentum of the system divided by the total mass of the system = average velocity of the system.
+                let our_mass = cell.species.get_mass() * cell.species.get_solidity();
+                let their_mass = other.map(|o| o.species.get_mass() * o.species.get_solidity()).unwrap_or(1.0);
+                let their_momentum = other.map(|o| vec2_scale(o.velocity, their_mass)).unwrap_or_default();
+                let system_momentum = vec2_add(vec2_scale(cell.velocity, our_mass), their_momentum);
+                let system_velocity = vec2_scale(system_momentum, 1.0/(our_mass + their_mass));
+
+                let subgrid_offset = vec2_sub(other.map(Cell::get_subgrid_offset).unwrap_or_default(), cell.get_subgrid_offset());
+                let impact_dir = vec2_normalized(vec2_add(rel_pos, subgrid_offset));
+
+                let elasticity = cell.species.get_elasticity() * other.map(|o| o.species.get_elasticity()).unwrap_or(0.2);
+                let our_impact = vec2_scale(impact_dir, vec2_dot(impact_dir, vec2_sub(cell.velocity, system_velocity)) * -(1.0 + elasticity));
+                let their_impact = other.map(|other| vec2_scale(impact_dir, vec2_dot(impact_dir, vec2_sub(other.velocity, system_velocity)) * -(1.0 + elasticity))).unwrap_or_default();
+                let cell = grid_get_mut(&mut self.grid, loc).unwrap();
+                cell.velocity = vec2_add(cell.velocity, our_impact);
+                if let Some(other) = grid_get_mut(&mut self.grid, dest) {
+                    other.velocity = vec2_add(other.velocity, their_impact);
+                }
+
+                // 2. Calculate and apply friction
                 let cell = grid_get_mut(&mut self.grid, loc).unwrap();
                 let friction_coeff = cell.species.get_friction_coeff();
                 let heat = vec2_scale(cell.velocity, friction_coeff / 4.0 * cell.species.get_mass());
@@ -202,35 +252,13 @@ impl Board {
                         other.velocity = vec2_add(other.velocity, vec2_scale(heat, 1.0 / other.species.get_mass()));
                     }
                 }
-
-                // 2. Calculate and apply pushing
-                let cell = grid_get(&self.grid, loc).unwrap();
-                let offset = velocity_to_offset(cell.velocity);
-                let rel_pos = [offset[0] as f32, offset[1] as f32];
-                let dest = vec2_add(loc, offset);
-                let other = grid_get(&self.grid, dest);
-                let fluidity = cell.species.get_fluidity() * other.map(|c| c.species.get_fluidity()).unwrap_or_default();
-
-                // TODO: Board::velocity_step: Did I calculate elastic collisions correctly?
-                let rel_vel = vec2_sub(cell.velocity, other.map_or([0.0, 0.0], |o| o.velocity));
-                // let rel_impact = vec2_mul(rel_vel, vec2_normalized(vec2_add(rel_pos, vec2_sub(other.map_or([0.0, 0.0], |o| o.species.get_subgrid_offset()), cell.species.get_subgrid_offset()))));
-                let impact_dir = vec2_normalized(vec2_add(rel_pos, vec2_sub(other.map_or([0.0, 0.0], |o| o.species.get_subgrid_offset()), cell.species.get_subgrid_offset())));
-                let rel_impact = vec2_scale(impact_dir, vec2_dot(impact_dir, rel_vel));
-                let our_impact = vec2_scale(rel_impact, -0.5);
-                let their_impact = other.map(|other| vec2_scale(rel_impact, 0.5 * cell.species.get_mass() / other.species.get_mass())).unwrap_or_default();
-                let cell = grid_get_mut(&mut self.grid, loc).unwrap();
-                cell.velocity = vec2_add(cell.velocity, our_impact);
-                if let Some(other) = grid_get_mut(&mut self.grid, dest) {
-                    other.velocity = vec2_add(other.velocity, their_impact);
-                }
             }
         }
     }
     /// What it says on the tin
     fn copy_velocity_to_motion(&mut self) {
         for cell in self.grid.iter_mut() {
-            // TODO: Board::copy_velocity_to_motion: consider using += instead of =, maintaining last step's leftover motion.
-            cell.motion = cell.velocity;
+            cell.motion = vec2_add(cap_vec(cell.motion), cell.velocity);
             //HACKHACK: Try to calm the sandstorm by removing all motion from air
             if cell.species == Species::Air {
                 cell.motion = Default::default();
@@ -271,14 +299,21 @@ impl Board {
 }
 
 fn main() {
-    let mut board = Board::new(16, 16);
-    for cell in board.grid.iter_col_mut(2) {
+    let mut board = Board::new(24, 32);
+    for cell in board.grid.iter_col_mut(8) {
         cell.species = Species::Sand;
+    }
+    for cell in board.grid.iter_col_mut(12) {
+        cell.species = Species::Water;
+    }
+    for cell in board.grid.iter_mut() {
+        // Small perturbation, to prevent them from being perfect <3
+        cell.motion = [random::<f32>() * 0.1 - 0.05, random::<f32>() * 0.1 - 0.05];
     }
     loop {
         board.print();
         board.step();
-        std::thread::sleep_ms(100);
+        std::thread::sleep(std::time::Duration::from_millis(50));
         println!("------");
     }
 }
